@@ -7,3 +7,4 @@ apify-client
 openpyxl
 requests
 python-dotenv
+google-auth
