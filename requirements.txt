@@ -1,0 +1,9 @@
+streamlit
+pandas
+sqlalchemy
+psycopg2-binary
+google-cloud-storage
+apify-client
+openpyxl
+requests
+python-dotenv
