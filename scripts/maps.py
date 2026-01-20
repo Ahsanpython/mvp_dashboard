@@ -5,6 +5,9 @@ import time
 from datetime import datetime
 import json
 from pathlib import Path
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 
 from db import start_run, finish_run, insert_df
 
@@ -269,3 +272,4 @@ if __name__ == "__main__":
         selected_keywords=selected_keywords,
         use_progress=use_progress
     )
+
