@@ -63,6 +63,7 @@ JOBS = {
     "Instagram Followers": "job-instagram-followers",
 }
 
+
 SOURCES = {
     "Google Maps": "maps",
     "Yelp": "yelp",
@@ -213,11 +214,9 @@ def _build_overrides(env: Dict[str, str]) -> Dict[str, Any]:
     # Cloud Run Jobs v2 "run" expects containerOverrides
     return {"containerOverrides": [{"env": _env_list(env)}]}
 
+def _trigger(job_short_name: str, env: dict):
+    return trigger_job(job_short_name, env_overrides=env, project_id=GCP_PROJECT, region=GCP_REGION)
 
-def _trigger(job_name: str, env: Dict[str, str]) -> Dict[str, Any]:
-    # jobs.py already reads project + region from env vars.
-    overrides = _build_overrides(env)
-    return trigger_job(job_name, overrides=overrides)
 
 
 # -----------------------------
