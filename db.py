@@ -33,6 +33,12 @@ def _engine():
 
 
 def init_db():
+    """
+    Creates tables + indexes if needed.
+    If your DB user is not the owner, CREATE INDEX can fail with:
+    'must be owner of table ...'
+    Fix ownership in Cloud SQL (recommended), but we also guard here.
+    """
     eng = _engine()
     with eng.begin() as conn:
         conn.execute(text("""
@@ -46,6 +52,7 @@ def init_db():
             meta JSONB
         );
         """))
+
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS events (
             id BIGSERIAL PRIMARY KEY,
@@ -55,8 +62,18 @@ def init_db():
             payload JSONB NOT NULL
         );
         """))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_source_created ON events(source, created_at DESC);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);"))
+
+        # Indexes (may fail if DB user is not table owner)
+        try:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_events_source_created ON events(source, created_at DESC);"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);"
+            ))
+        except Exception as e:
+            # Don't crash the whole app. Inserts still work without indexes.
+            print(f"[db] index create skipped: {e}")
 
 
 def start_run(source: str, label: str = "") -> int:
@@ -112,9 +129,6 @@ def insert_event(run_id: int, source: str, payload: Dict[str, Any]):
 
 
 def insert_df(run_id: int, source: str, df: pd.DataFrame):
-    """
-    Safe for ANY columns. Stores each row as JSON in events.payload.
-    """
     if df is None or df.empty:
         return
 
