@@ -1,156 +1,61 @@
-# db.py
+# jobs.py
 import os
-import json
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Dict, Any, Optional
 
-import pandas as pd
-from sqlalchemy import create_engine, text
-
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
-_ENGINE = None
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
 
 
-def _utcnow():
-    return datetime.now(timezone.utc)
+def _project_id() -> str:
+    return (
+        os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GCP_PROJECT")
+        or os.getenv("PROJECT_ID")
+        or ""
+    ).strip()
 
 
-def _engine():
-    global _ENGINE
-    if _ENGINE is not None:
-        return _ENGINE
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL is empty. Set it in Cloud Run Service + Jobs env vars.")
-    _ENGINE = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
-        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
-        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
-        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
-    )
-    return _ENGINE
+def _region() -> str:
+    return (os.getenv("GCP_REGION") or "").strip()
 
 
-def init_db():
+def trigger_job(job_name: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Creates tables + indexes if needed.
-    If your DB user is not the owner, CREATE INDEX can fail with:
-    'must be owner of table ...'
-    Fix ownership in Cloud SQL (recommended), but we also guard here.
+    Cloud Run Jobs v2 REST:
+    POST https://run.googleapis.com/v2/projects/{project}/locations/{region}/jobs/{job}:run
+
+    Body:
+      { "overrides": { "containerOverrides": [ { "env": [ {"name":"X","value":"Y"} ] } ] } }
+
+    containerOverrides/env overrides are supported by Cloud Run v2. :contentReference[oaicite:0]{index=0}
     """
-    eng = _engine()
-    with eng.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS runs (
-            id BIGSERIAL PRIMARY KEY,
-            source TEXT NOT NULL,
-            label TEXT DEFAULT '',
-            started_at TIMESTAMPTZ NOT NULL,
-            finished_at TIMESTAMPTZ,
-            status TEXT NOT NULL DEFAULT 'running',
-            meta JSONB
-        );
-        """))
+    project = _project_id()
+    region = _region()
 
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS events (
-            id BIGSERIAL PRIMARY KEY,
-            run_id BIGINT REFERENCES runs(id) ON DELETE SET NULL,
-            source TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL,
-            payload JSONB NOT NULL
-        );
-        """))
+    if not project:
+        return {"ok": False, "status": 400, "error": "Missing GOOGLE_CLOUD_PROJECT or GCP_PROJECT."}
+    if not region:
+        return {"ok": False, "status": 400, "error": "Missing GCP_REGION (example: us-central1)."}
+    if not job_name:
+        return {"ok": False, "status": 400, "error": "Missing job_name."}
 
-        # Indexes (may fail if DB user is not table owner)
-        try:
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS idx_events_source_created ON events(source, created_at DESC);"
-            ))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);"
-            ))
-        except Exception as e:
-            # Don't crash the whole app. Inserts still work without indexes.
-            print(f"[db] index create skipped: {e}")
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    session = AuthorizedSession(creds)
 
+    url = f"https://run.googleapis.com/v2/projects/{project}/locations/{region}/jobs/{job_name}:run"
 
-def start_run(source: str, label: str = "") -> int:
-    init_db()
-    eng = _engine()
-    with eng.begin() as conn:
-        res = conn.execute(
-            text("""
-                INSERT INTO runs (source, label, started_at, status)
-                VALUES (:source, :label, :started_at, 'running')
-                RETURNING id
-            """),
-            {"source": source, "label": label or "", "started_at": _utcnow()},
-        )
-        return int(res.scalar())
+    payload: Dict[str, Any] = {}
+    if overrides:
+        payload = {"overrides": overrides}
 
+    resp = session.post(url, json=payload, timeout=60)
 
-def finish_run(run_id: int, status: str, meta: Optional[Dict[str, Any]] = None):
-    init_db()
-    eng = _engine()
-    with eng.begin() as conn:
-        conn.execute(
-            text("""
-                UPDATE runs
-                SET status=:status, finished_at=:finished_at, meta=:meta
-                WHERE id=:id
-            """),
-            {
-                "id": int(run_id),
-                "status": status,
-                "finished_at": _utcnow(),
-                "meta": meta if meta else None,
-            },
-        )
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"text": resp.text}
 
+    if resp.status_code >= 300:
+        return {"ok": False, "status": resp.status_code, "error": data}
 
-def insert_event(run_id: int, source: str, payload: Dict[str, Any]):
-    init_db()
-    eng = _engine()
-    with eng.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO events (run_id, source, created_at, payload)
-                VALUES (:run_id, :source, :created_at, :payload)
-            """),
-            {
-                "run_id": int(run_id),
-                "source": source,
-                "created_at": _utcnow(),
-                "payload": payload,
-            },
-        )
-
-
-def insert_df(run_id: int, source: str, df: pd.DataFrame):
-    if df is None or df.empty:
-        return
-
-    init_db()
-    eng = _engine()
-
-    df2 = df.copy()
-    df2 = df2.where(pd.notnull(df2), None)
-
-    rows = df2.to_dict(orient="records")
-
-    with eng.begin() as conn:
-        for r in rows:
-            conn.execute(
-                text("""
-                    INSERT INTO events (run_id, source, created_at, payload)
-                    VALUES (:run_id, :source, :created_at, :payload)
-                """),
-                {
-                    "run_id": int(run_id),
-                    "source": source,
-                    "created_at": _utcnow(),
-                    "payload": json.loads(json.dumps(r, default=str)),
-                },
-            )
+    return {"ok": True, "status": resp.status_code, "data": data}
