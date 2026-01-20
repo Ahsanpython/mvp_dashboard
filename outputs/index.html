@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Spotify Popularity Explorer</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+</head>
+
+<body>
+  <header class="app-header">
+    <div class="header-left">
+      <h1>What Makes a Spotify Track Popular?</h1>
+      <p class="subtitle">
+        Explore feature relationships, genre differences, and popularity trends through linked interactive views.
+      </p>
+    </div>
+
+    <div class="controls">
+      <div class="control">
+        <label for="genreSelect">Genre</label>
+        <select id="genreSelect"></select>
+      </div>
+
+      <div class="control">
+        <label>Year range</label>
+        <div class="range-row">
+          <input id="yearMin" type="number" step="1" />
+          <span class="range-sep">to</span>
+          <input id="yearMax" type="number" step="1" />
+        </div>
+      </div>
+
+      <div class="control">
+        <label>Popularity range</label>
+        <div class="range-row">
+          <input id="popMin" type="number" min="0" max="100" step="1" />
+          <span class="range-sep">to</span>
+          <input id="popMax" type="number" min="0" max="100" step="1" />
+        </div>
+      </div>
+
+      <div class="control actions">
+        <button id="clearBrushBtn" type="button">Clear selection</button>
+        <button id="resetBtn" type="button">Reset filters</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card card-wide">
+      <div class="card-header">
+        <h2>Feature relationship: Energy vs Popularity</h2>
+        <p class="card-meta" id="scatterMeta"></p>
+      </div>
+      <div class="viz" id="scatter"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Avg popularity by genre (Top 10)</h2>
+        <p class="card-meta" id="barMeta"></p>
+      </div>
+      <div class="viz" id="bar"></div>
+    </section>
+
+    <section class="card card-wide">
+      <div class="card-header">
+        <h2>Popularity over time</h2>
+        <p class="card-meta" id="lineMeta"></p>
+      </div>
+      <div class="viz" id="line"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Correlation heatmap (current subset)</h2>
+        <p class="card-meta" id="heatMeta"></p>
+      </div>
+      <div class="viz" id="heatmap"></div>
+    </section>
+  </main>
+
+  <div id="tooltip" class="tooltip" aria-hidden="true"></div>
+
+  <footer class="footer">
+    <span id="status"></span>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script src="main.js"></script>
+</body>
+</html>
