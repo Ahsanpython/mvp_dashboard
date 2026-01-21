@@ -5,15 +5,26 @@ import time
 from datetime import datetime
 import json
 from pathlib import Path
-import os, sys
+import sys
+import traceback
+
+# Allow importing db.py from project root
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 print("=== MAPS JOB STARTED ===", flush=True)
 print("python:", sys.version, flush=True)
 print("cwd:", os.getcwd(), flush=True)
 print("argv:", sys.argv, flush=True)
+
+# Show key envs (DON'T print secrets)
 print("DATABASE_URL set:", bool(os.getenv("DATABASE_URL")), flush=True)
-
-
+print("APIFY_TOKEN set:", bool(os.getenv("APIFY_TOKEN")), flush=True)
+print("GCS_BUCKET:", (os.getenv("GCS_BUCKET") or "").strip(), flush=True)
+print("USE_PROGRESS:", os.getenv("USE_PROGRESS", ""), flush=True)
+print("CITY:", os.getenv("CITY", ""), flush=True)
+print("KEYWORDS:", os.getenv("KEYWORDS", ""), flush=True)
+print("SELECTED_CITY:", os.getenv("SELECTED_CITY", ""), flush=True)
+print("SELECTED_KEYWORDS:", os.getenv("SELECTED_KEYWORDS", ""), flush=True)
 
 from db import start_run, finish_run, insert_df
 
@@ -173,9 +184,11 @@ def save_to_master(existing_data, new_data, city):
 
 def scrape_city(city, keywords):
     city_results = []
+    print(f"Scraping city={city} keywords_count={len(keywords)}", flush=True)
 
     for keyword in keywords:
         search_query = f"{keyword} {city}"
+        print("Query:", search_query, flush=True)
 
         run_input = {
             "searchStringsArray": [search_query],
@@ -189,8 +202,12 @@ def scrape_city(city, keywords):
         }
 
         run = client.actor("WnMxbsRLNbPeYL6ge").call(run_input=run_input)
+        ds_id = run.get("defaultDatasetId")
+        print("Apify dataset:", ds_id, flush=True)
 
-        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        count = 0
+        for item in client.dataset(ds_id).iterate_items():
+            count += 1
             city_results.append({
                 "Title": item.get("title", ""),
                 "Address": item.get("address", ""),
@@ -203,10 +220,26 @@ def scrape_city(city, keywords):
                 "Search_City": city,
             })
 
+        print(f"Items fetched for '{keyword}': {count}", flush=True)
         time.sleep(float(os.getenv("SLEEP_SECONDS", "2")))
 
-
+    print("Total results:", len(city_results), flush=True)
     return city_results
+
+
+def _parse_keywords(s: str):
+    s = (s or "").strip()
+    if not s:
+        return None
+    # support | or , separated
+    if "|" in s:
+        parts = [p.strip() for p in s.split("|")]
+    elif "," in s:
+        parts = [p.strip() for p in s.split(",")]
+    else:
+        parts = [s.strip()]
+    parts = [p for p in parts if p]
+    return parts or None
 
 
 def main(selected_city=None, selected_keywords=None, use_progress=False):
@@ -232,7 +265,7 @@ def main(selected_city=None, selected_keywords=None, use_progress=False):
             new_df = pd.DataFrame(new_results)
 
             # Excel master (local /tmp + optional GCS)
-            updated_data = save_to_master(existing_data, new_df, current_city)
+            save_to_master(existing_data, new_df, current_city)
 
             # Live dashboard: insert ONLY new rows (this run) into DB
             df_live = new_df.copy()
@@ -248,35 +281,38 @@ def main(selected_city=None, selected_keywords=None, use_progress=False):
             progress["last_run_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             save_progress(progress)
 
-            finish_run(run_id, "ok")
-            return updated_data
+            finish_run(run_id, "ok", meta={"rows": int(len(new_df)), "city": current_city})
+            print("=== MAPS JOB FINISHED OK (rows:", len(new_df), ") ===", flush=True)
+            return
 
+        # no results
         progress["last_completed_city"] = current_city
         if current_city not in progress.get("completed_cities", []):
             progress["completed_cities"] = progress.get("completed_cities", []) + [current_city]
         save_progress(progress)
 
-        finish_run(run_id, "ok")
-        return pd.DataFrame()
+        finish_run(run_id, "ok", meta={"rows": 0, "city": current_city})
+        print("=== MAPS JOB FINISHED OK (0 rows) ===", flush=True)
+        return
 
-    except Exception:
-        finish_run(run_id, "error")
+    except Exception as e:
+        print("=== MAPS JOB ERROR ===", flush=True)
+        traceback.print_exc()
+        finish_run(run_id, "error", meta={"error": str(e)})
         raise
 
 
 if __name__ == "__main__":
-    selected_city = os.getenv("SELECTED_CITY", "")
-    raw_keywords = os.getenv("SELECTED_KEYWORDS", "").strip()
+    # Support BOTH naming styles from your job env
+    # Priority: SELECTED_* then CITY/KEYWORDS
+    selected_city = (os.getenv("SELECTED_CITY") or os.getenv("CITY") or "").strip()
+    raw_keywords = (os.getenv("SELECTED_KEYWORDS") or os.getenv("KEYWORDS") or "").strip()
     use_progress = os.getenv("USE_PROGRESS", "0").strip() == "1"
 
-    selected_keywords = None
-    if raw_keywords:
-        selected_keywords = [k.strip() for k in raw_keywords.split("|") if k.strip()]
+    selected_keywords = _parse_keywords(raw_keywords)
 
     main(
         selected_city=selected_city if selected_city else None,
         selected_keywords=selected_keywords,
         use_progress=use_progress
     )
-
-
