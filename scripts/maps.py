@@ -7,6 +7,12 @@ import json
 from pathlib import Path
 import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+print("=== MAPS JOB STARTED ===", flush=True)
+print("python:", sys.version, flush=True)
+print("cwd:", os.getcwd(), flush=True)
+print("argv:", sys.argv, flush=True)
+print("DATABASE_URL set:", bool(os.getenv("DATABASE_URL")), flush=True)
+
 
 
 from db import start_run, finish_run, insert_df
@@ -272,4 +278,5 @@ if __name__ == "__main__":
         selected_keywords=selected_keywords,
         use_progress=use_progress
     )
+
 
