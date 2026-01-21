@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.dialects.postgresql import JSONB
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 _ENGINE = None
@@ -32,12 +33,53 @@ def _engine():
     return _ENGINE
 
 
+def _jsonable(obj: Any) -> Any:
+    """
+    Convert pandas / datetime / weird objects into JSON-safe types.
+    Always returns something that json.dumps can handle.
+    """
+    if obj is None:
+        return None
+
+    # pandas NaN / NA
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+
+    # datetimes
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+
+    # basic containers: recurse
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+
+    # everything else: keep if json can handle, otherwise stringify
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        return str(obj)
+
+
+def _as_jsonb(v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Make sure we always pass a JSONB-friendly python object to SQLAlchemy.
+    """
+    if not v:
+        return None
+    return _jsonable(v)
+
+
 def init_db():
     """
     Creates tables + indexes if needed.
     If your DB user is not the owner, CREATE INDEX can fail with:
     'must be owner of table ...'
-    Fix ownership in Cloud SQL (recommended), but we also guard here.
     """
     eng = _engine()
     with eng.begin() as conn:
@@ -63,7 +105,6 @@ def init_db():
         );
         """))
 
-        # Indexes (may fail if DB user is not table owner)
         try:
             conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS idx_events_source_created ON events(source, created_at DESC);"
@@ -72,8 +113,7 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);"
             ))
         except Exception as e:
-            # Don't crash the whole app. Inserts still work without indexes.
-            print(f"[db] index create skipped: {e}")
+            print(f"[db] index create skipped: {e}", flush=True)
 
 
 def start_run(source: str, label: str = "") -> int:
@@ -94,18 +134,24 @@ def start_run(source: str, label: str = "") -> int:
 def finish_run(run_id: int, status: str, meta: Optional[Dict[str, Any]] = None):
     init_db()
     eng = _engine()
+
+    meta2 = _as_jsonb(meta)
+
+    # Use explicit JSONB bind to avoid psycopg2 "can't adapt dict" issues
+    stmt = text("""
+        UPDATE runs
+        SET status=:status, finished_at=:finished_at, meta=:meta
+        WHERE id=:id
+    """).bindparams(meta=JSONB)
+
     with eng.begin() as conn:
         conn.execute(
-            text("""
-                UPDATE runs
-                SET status=:status, finished_at=:finished_at, meta=:meta
-                WHERE id=:id
-            """),
+            stmt,
             {
                 "id": int(run_id),
                 "status": status,
                 "finished_at": _utcnow(),
-                "meta": meta if meta else None,
+                "meta": meta2,
             },
         )
 
@@ -113,17 +159,22 @@ def finish_run(run_id: int, status: str, meta: Optional[Dict[str, Any]] = None):
 def insert_event(run_id: int, source: str, payload: Dict[str, Any]):
     init_db()
     eng = _engine()
+
+    payload2 = _as_jsonb(payload) or {}
+
+    stmt = text("""
+        INSERT INTO events (run_id, source, created_at, payload)
+        VALUES (:run_id, :source, :created_at, :payload)
+    """).bindparams(payload=JSONB)
+
     with eng.begin() as conn:
         conn.execute(
-            text("""
-                INSERT INTO events (run_id, source, created_at, payload)
-                VALUES (:run_id, :source, :created_at, :payload)
-            """),
+            stmt,
             {
                 "run_id": int(run_id),
                 "source": source,
                 "created_at": _utcnow(),
-                "payload": payload,
+                "payload": payload2,
             },
         )
 
@@ -140,17 +191,19 @@ def insert_df(run_id: int, source: str, df: pd.DataFrame):
 
     rows = df2.to_dict(orient="records")
 
+    stmt = text("""
+        INSERT INTO events (run_id, source, created_at, payload)
+        VALUES (:run_id, :source, :created_at, :payload)
+    """).bindparams(payload=JSONB)
+
     with eng.begin() as conn:
         for r in rows:
             conn.execute(
-                text("""
-                    INSERT INTO events (run_id, source, created_at, payload)
-                    VALUES (:run_id, :source, :created_at, :payload)
-                """),
+                stmt,
                 {
                     "run_id": int(run_id),
                     "source": source,
                     "created_at": _utcnow(),
-                    "payload": json.loads(json.dumps(r, default=str)),
+                    "payload": _as_jsonb(r) or {},
                 },
             )
