@@ -10,58 +10,44 @@ def _project_id() -> str:
     return (
         os.getenv("GOOGLE_CLOUD_PROJECT")
         or os.getenv("GCP_PROJECT")
+        or os.getenv("PROJECT_ID")
         or ""
     ).strip()
 
 
 def _region() -> str:
-    return os.getenv("GCP_REGION", "us-central1").strip()
+    return os.getenv("GCP_REGION", "").strip()
 
 
-def trigger_job(
-    job_name: str,
-    env_overrides: Optional[Dict[str, str]] = None,
-    project_id: Optional[str] = None,
-    region: Optional[str] = None,
-) -> Dict[str, Any]:
+def trigger_job(job_name: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Triggers a Cloud Run Job execution.
-    """
+    Triggers a Cloud Run Job execution via Cloud Run v2 API.
 
-    project = project_id or _project_id()
-    region = region or _region()
+    overrides should be the *inner* object that goes under "overrides", for example:
+    {
+      "containerOverrides": [{
+        "env": [{"name":"RUN_LABEL","value":"manual"}]
+      }]
+    }
+    """
+    project = _project_id()
+    region = _region()
 
     if not project:
-        return {"ok": False, "error": "Missing project id"}
+        return {"ok": False, "error": "Missing project id env var (GOOGLE_CLOUD_PROJECT or GCP_PROJECT)."}
     if not region:
-        return {"ok": False, "error": "Missing region"}
+        return {"ok": False, "error": "Missing GCP_REGION env var (set to your Cloud Run region, e.g. us-central1)."}
     if not job_name:
-        return {"ok": False, "error": "Missing job name"}
+        return {"ok": False, "error": "Missing job_name."}
 
-    creds, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     session = AuthorizedSession(creds)
 
-    url = (
-        f"https://run.googleapis.com/v2/projects/{project}"
-        f"/locations/{region}/jobs/{job_name}:run"
-    )
+    url = f"https://run.googleapis.com/v2/projects/{project}/locations/{region}/jobs/{job_name}:run"
 
     payload = {}
-    if env_overrides:
-        payload = {
-            "overrides": {
-                "containerOverrides": [
-                    {
-                        "env": [
-                            {"name": k, "value": str(v)}
-                            for k, v in env_overrides.items()
-                        ]
-                    }
-                ]
-            }
-        }
+    if overrides:
+        payload = {"overrides": overrides}   # <-- THIS is the important fix
 
     resp = session.post(url, json=payload, timeout=60)
 
