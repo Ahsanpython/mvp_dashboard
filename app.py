@@ -444,7 +444,14 @@ with tab_results:
             st.subheader("Runs")
             runs_df = _db_read_df(
                 """
-                SELECT id, run_id, source, label, status, started_at, finished_at, created_at
+                SELECT
+                  id,
+                  source,
+                  label,
+                  status,
+                  started_at,
+                  finished_at,
+                  started_at AS created_at
                 FROM runs
                 ORDER BY id DESC
                 LIMIT 200
