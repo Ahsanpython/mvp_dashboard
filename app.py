@@ -49,14 +49,45 @@ if not CITY_LIST:
 
 
 # -----------------------------
+# Default keywords (so selection works even if MODULE_CONFIG_JSON is not set)
+# -----------------------------
+MAPS_YELP_KEYWORDS = [
+    "Medspa", "Aesthetic Clinic", "Cosmetic Dermatology", "Plastic Surgery",
+    "Laser Clinic", "Skin Care Clinic", "Botox", "Filler", "Dysport", "Jeuveau",
+    "Kybella", "PRP", "Microneedling", "RF Microneedling", "IPL", "Laser Hair Removal",
+    "Tattoo Removal", "Body Contouring", "Hair Restoration", "Cryotherapy",
+    "IV Therapy", "IV Hydration", "Weight Loss Clinic", "Semaglutide", "Tirzepatide",
+    "GLP-1 Clinic", "Hormone Therapy", "HRT", "TRT", "Peptide Therapy",
+    "Functional Medicine", "Longevity Clinic", "Wellness Center",
+    "Primary Care", "Urgent Care", "OBGYN", "Chronic Care", "Urology",
+    "Chronic Care Management", "Medication Management", "Medicare Clinic",
+    "Solo Practice", "Small Group Practice",
+]
+
+SOCIAL_CATEGORIES = {
+    "Peptide": [
+        "peptide", "collagenpeptides", "copperpeptides", "skincare", "antiaging",
+        "bpc157", "tb500", "semaglutide", "tirzepatide", "wellness", "weightloss", "prp"
+    ],
+    "Biohacking": [
+        "biohacking", "biohacker", "longevity", "nootropics", "redlighttherapy",
+        "wearables", "sleepoptimization", "coldplunge", "sauna", "hrv",
+        "functionalmedicine", "recovery"
+    ],
+    "Regenerative Medicine": [
+        "regenerativemedicine", "prp", "stemcelltherapy", "exosomes", "orthopedics",
+        "sportsmedicine", "aestheticmedicine", "jointpain", "arthritis",
+        "painmanagement", "hairrestoration", "celltherapy"
+    ]
+}
+
+
+# -----------------------------
 # Module config
-# IMPORTANT: Dashboard cannot read keywords from each job's python file.
-# You must provide keywords for each module via env MODULE_CONFIG_JSON (recommended).
-# Supported JSON patterns:
-# 1) list keywords:
-#    {"YouTube": {"keywords": ["peptide","biohacking"]}}
-# 2) grouped keywords:
-#    {"YouTube": {"keyword_groups": {"Peptide": ["peptide","bpc157"], "Biohacking": ["biohacking"]}}}
+# NOTE:
+# - The dashboard cannot read keywords from each job's python file.
+# - Best practice is MODULE_CONFIG_JSON in Cloud Run env vars.
+# - But we also provide solid defaults here so UI works right away.
 # -----------------------------
 DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
     "Google Maps": {
@@ -64,14 +95,14 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "source": "maps",
         "needs_city": True,
         "needs_keywords": True,
-        "keywords": [],
+        "keywords": MAPS_YELP_KEYWORDS,
     },
     "Yelp": {
         "job": "job-yelp",
         "source": "yelp",
         "needs_city": True,
         "needs_keywords": True,
-        "keywords": [],
+        "keywords": MAPS_YELP_KEYWORDS,
     },
     "Hunter": {
         "job": "job-hunter",
@@ -87,7 +118,7 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "needs_city": False,
         "needs_keywords": True,
         "keywords": [],
-        "keyword_groups": {},
+        "keyword_groups": SOCIAL_CATEGORIES,
     },
     "TikTok Hashtags": {
         "job": "job-tiktok-hashtags",
@@ -95,7 +126,7 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "needs_city": False,
         "needs_keywords": True,
         "keywords": [],
-        "keyword_groups": {},
+        "keyword_groups": SOCIAL_CATEGORIES,
     },
     "TikTok Followers": {
         "job": "job-tiktok-followers",
@@ -111,7 +142,7 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "needs_city": False,
         "needs_keywords": True,
         "keywords": [],
-        "keyword_groups": {},
+        "keyword_groups": SOCIAL_CATEGORIES,
     },
     "Instagram Followers": {
         "job": "job-instagram-followers",
@@ -162,7 +193,6 @@ st.markdown(
       .muted{ opacity: 0.70; font-size: 12px; margin-top: 4px; }
       .stButton>button{ border-radius: 12px !important; padding: 0.65rem 0.95rem !important; font-weight: 720 !important; }
       code { font-size: 12px !important; }
-      .small-note { opacity: 0.75; font-size: 12px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -270,11 +300,97 @@ def _trigger(job_name: str, env: Dict[str, str]) -> Dict[str, Any]:
 
 
 # -----------------------------
+# Helpers: keyword parsing (fixes your "can’t select" issue)
+# Accepts:
+# - Python list like: ["A","B"]
+# - JSON list like: ["A","B"]
+# - Comma-separated like: A, B, C
+# - One-per-line
+# - Lines with comments starting #
+# - Lines like: "A", "B",
+# -----------------------------
+def _parse_keywords(raw: str) -> List[str]:
+    if not raw:
+        return []
+    s = raw.strip()
+
+    # Try JSON list first
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, list):
+                out = []
+                for x in obj:
+                    t = str(x).strip()
+                    if t:
+                        out.append(t)
+                return list(dict.fromkeys(out))
+        except Exception:
+            pass
+
+    # Otherwise: split by newline + comma
+    tokens: List[str] = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        # remove trailing commas
+        if line.endswith(","):
+            line = line[:-1].strip()
+        # if line contains commas, split
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        for p in parts:
+            # strip quotes
+            if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+                p = p[1:-1].strip()
+            # ignore python assignment prefixes
+            if "=" in p and p.lower().endswith("["):
+                continue
+            if p:
+                tokens.append(p)
+
+    # de-dup, keep order
+    return list(dict.fromkeys(tokens))
+
+
+# -----------------------------
+# Helpers: Excel-safe dataframe (fixes timezone crash)
+# -----------------------------
+def _excel_safe_df(df):
+    if pd is None or df is None:
+        return df
+    out = df.copy()
+
+    for col in out.columns:
+        s = out[col]
+
+        # datetime64 tz-aware columns
+        try:
+            if hasattr(s.dtype, "tz") and s.dtype.tz is not None:
+                out[col] = s.dt.tz_convert(None)
+                continue
+        except Exception:
+            pass
+
+        # object columns that might contain tz-aware timestamps
+        if s.dtype == "object":
+            try:
+                parsed = pd.to_datetime(s, errors="raise", utc=True)
+                out[col] = parsed.dt.tz_convert(None)
+            except Exception:
+                pass
+
+    return out
+
+
+# -----------------------------
 # Sidebar (minimal)
 # -----------------------------
 with st.sidebar:
     st.markdown("### Status")
-    st.write(f"Project: `{GCP_PROJECT or '-'}'")
+    st.write(f"Project: `{GCP_PROJECT or '-'}`")
     st.write(f"Region: `{GCP_REGION}`")
     st.write(f"Database: `{'set' if DATABASE_URL else 'missing'}`")
     st.write(f"Storage: `{'set' if GCS_BUCKET else 'missing'}`")
@@ -311,12 +427,10 @@ with tab_run:
     # Keywords / Hashtags (only when needed)
     selected_keywords_pipe = ""
     selected_keyword_group = ""
+
     if bool(mcfg.get("needs_keywords")):
         st.markdown("#### Keywords / Hashtags")
 
-        # Support either:
-        # - keywords: ["a","b"]
-        # - keyword_groups: {"Peptide":[...], "Biohacking":[...]}
         preset_keywords = mcfg.get("keywords") or []
         keyword_groups = mcfg.get("keyword_groups") or {}
 
@@ -325,7 +439,7 @@ with tab_run:
             keyword_groups = preset_keywords
             preset_keywords = []
 
-        # Clean
+        # Clean lists
         if isinstance(preset_keywords, list):
             preset_keywords = [str(x).strip() for x in preset_keywords if str(x).strip()]
         else:
@@ -340,31 +454,26 @@ with tab_run:
         else:
             keyword_groups = {}
 
-        # If grouped mode exists, show group selector
+        # Optional: paste extra keywords (supports python list / comma / lines)
+        extra_raw = st.text_area("Paste extra keywords (optional)", value="", height=80)
+        extra_keywords = _parse_keywords(extra_raw)
+
         if keyword_groups:
             group_names = list(keyword_groups.keys())
             selected_keyword_group = st.selectbox("Category", group_names, index=0)
-
-            base_options = keyword_groups.get(selected_keyword_group) or []
-
-            # FIX: let user paste additional keywords and still populate "Select"
-            pasted = st.text_area("Paste one per line (optional)", value="", height=90)
-            pasted_list = [k.strip() for k in pasted.splitlines() if k.strip()]
-
-            merged_options = list(dict.fromkeys(base_options + pasted_list))
-
-            selected_keywords = st.multiselect("Select", options=merged_options, default=base_options)
+            base_options = (keyword_groups.get(selected_keyword_group) or []) + extra_keywords
+            # de-dup keep order
+            base_options = list(dict.fromkeys([x for x in base_options if x]))
+            selected_keywords = st.multiselect("Select", options=base_options, default=base_options)
             selected_keywords_pipe = _pipe_join(selected_keywords)
         else:
-            # Flat list mode
-            add_text = st.text_input("Add keywords (comma-separated)", value="")
-            added = [x.strip() for x in add_text.split(",") if x.strip()]
-            all_keywords = sorted(list(dict.fromkeys(preset_keywords + added)))
-
-            if not all_keywords:
-                pasted = st.text_area("Paste one per line", value="", height=90)
-                all_keywords = [k.strip() for k in pasted.splitlines() if k.strip()]
-
+            # Flat list mode with strong parsing
+            add_raw = st.text_area(
+                "Paste keywords (one per line, comma-separated, JSON list, or Python list)",
+                value="\n".join(preset_keywords),
+                height=120,
+            )
+            all_keywords = list(dict.fromkeys(_parse_keywords(add_raw) + extra_keywords))
             selected_keywords = st.multiselect("Select", options=all_keywords, default=all_keywords)
             selected_keywords_pipe = _pipe_join(selected_keywords)
 
@@ -379,7 +488,7 @@ with tab_run:
     if bool(mcfg.get("needs_yelp_input")):
         st.markdown("#### Input file")
         if not GCS_BUCKET:
-            st.error("Storage not set.")
+            st.error("Storage not set. Set GCS_BUCKET on the dashboard Cloud Run service.")
             st.stop()
         else:
             prefix = f"{GCS_OUTPUT_PREFIX}/"
@@ -405,7 +514,7 @@ with tab_run:
             up = st.file_uploader("Upload usernames file", type=["txt", "csv"])
             if up is not None:
                 if not GCS_BUCKET:
-                    st.error("Storage not set.")
+                    st.error("Storage not set. Set GCS_BUCKET on the dashboard Cloud Run service.")
                     st.stop()
                 data = up.read()
                 safe_name = up.name.replace(" ", "_")
@@ -474,7 +583,7 @@ with tab_run:
 # -----------------------------
 with tab_results:
     st.markdown(
-        '<div class="panel"><h3>Results</h3><div class="muted">View data in table format and export</div></div>',
+        '<div class="panel"><h3>Results</h3><div class="muted">View data in Excel-like table format and export</div></div>',
         unsafe_allow_html=True,
     )
     st.write("")
@@ -528,19 +637,11 @@ with tab_results:
                 flat = pd.json_normalize(events_df["payload"].tolist())
                 meta = events_df[["id", "run_id", "source", "created_at"]].reset_index(drop=True)
                 view_df = pd.concat([meta, flat], axis=1)
+                view_df = _excel_safe_df(view_df)
 
                 st.dataframe(view_df, use_container_width=True, height=420)
 
                 from io import BytesIO
-
-                # FIX: Excel cannot write tz-aware datetimes
-                def _excel_safe_df(df: pd.DataFrame) -> pd.DataFrame:
-                    df2 = df.copy()
-                    for col in df2.columns:
-                        s = df2[col]
-                        if pd.api.types.is_datetime64tz_dtype(s):
-                            df2[col] = s.dt.tz_convert(None)
-                    return df2
 
                 cexp1, cexp2 = st.columns([0.5, 0.5])
                 with cexp1:
@@ -554,9 +655,8 @@ with tab_results:
                     )
                 with cexp2:
                     buf = BytesIO()
-                    view_df_xlsx = _excel_safe_df(view_df)
                     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        view_df_xlsx.to_excel(writer, index=False, sheet_name="data")
+                        view_df.to_excel(writer, index=False, sheet_name="data")
                     st.download_button(
                         "Download Excel",
                         data=buf.getvalue(),
@@ -577,7 +677,7 @@ with tab_outputs:
     st.write("")
 
     if not GCS_BUCKET:
-        st.caption("Storage not set.")
+        st.caption("Storage not set. Set GCS_BUCKET on the dashboard Cloud Run service.")
     else:
         prefix = f"{GCS_OUTPUT_PREFIX}/"
         items = _gcs_list(prefix=prefix, limit=160)
