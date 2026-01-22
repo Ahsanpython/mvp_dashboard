@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 
 import streamlit as st
 
-try
+try:
     import pandas as pd
 except Exception:
     pd = None
