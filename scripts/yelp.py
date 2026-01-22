@@ -1,3 +1,4 @@
+# yelp.py
 from apify_client import ApifyClient
 import pandas as pd
 import os
@@ -13,6 +14,9 @@ except Exception:
     storage = None
 
 
+# -----------------------------
+# ENV
+# -----------------------------
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
 if not APIFY_TOKEN:
     raise ValueError("Missing APIFY_TOKEN env var")
@@ -20,14 +24,31 @@ if not APIFY_TOKEN:
 client = ApifyClient(APIFY_TOKEN)
 
 GCS_BUCKET = (os.getenv("GCS_BUCKET") or "").strip()
+GCS_OUTPUT_PREFIX = (os.getenv("GCS_OUTPUT_PREFIX") or "outputs").strip().strip("/")
+RUN_LABEL = (os.getenv("RUN_LABEL") or "").strip()
 
+# Local temp files
 MASTER_FILE = os.getenv("YELP_MASTER_FILE", "/tmp/Yelp_Master_Data.xlsx")
 PROGRESS_FILE = os.getenv("YELP_PROGRESS_FILE", "/tmp/yelp_scraping_progress.json")
 SEEN_URLS_FILE = os.getenv("YELP_SEEN_URLS_FILE", "/tmp/yelp_seen_urls.json")
 
-GCS_MASTER_OBJECT = os.getenv("GCS_YELP_MASTER_OBJECT", "exports/yelp/Yelp_Master_Data.xlsx")
-GCS_PROGRESS_OBJECT = os.getenv("GCS_YELP_PROGRESS_OBJECT", "exports/yelp/yelp_scraping_progress.json")
-GCS_SEEN_URLS_OBJECT = os.getenv("GCS_YELP_SEEN_URLS_OBJECT", "exports/yelp/yelp_seen_urls.json")
+# Store everything under outputs/ so dashboard + Hunter can see it
+# You can still override these via env if you want.
+GCS_MASTER_OBJECT = os.getenv(
+    "GCS_YELP_MASTER_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/yelp/Yelp_Master_Data.xlsx",
+).strip()
+
+GCS_PROGRESS_OBJECT = os.getenv(
+    "GCS_YELP_PROGRESS_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/yelp/yelp_scraping_progress.json",
+).strip()
+
+GCS_SEEN_URLS_OBJECT = os.getenv(
+    "GCS_YELP_SEEN_URLS_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/yelp/yelp_seen_urls.json",
+).strip()
+
 
 SEARCH_KEYWORDS = [
     "Medspa", "Aesthetic Clinic", "Cosmetic Dermatology", "Plastic Surgery",
@@ -51,6 +72,9 @@ CITIES = [
 ]
 
 
+# -----------------------------
+# GCS Helpers
+# -----------------------------
 def _gcs_client():
     if not GCS_BUCKET or storage is None:
         return None
@@ -70,16 +94,56 @@ def gcs_download_if_exists(local_path: str, object_name: str) -> bool:
     return True
 
 
-def gcs_upload(local_path: str, object_name: str) -> str:
+def gcs_upload(local_path: str, object_name: str, content_type: str = None) -> str:
     c = _gcs_client()
     if not c:
         return ""
     bucket = c.bucket(GCS_BUCKET)
     blob = bucket.blob(object_name)
+    if content_type:
+        blob.content_type = content_type
     blob.upload_from_filename(local_path)
     return f"gs://{GCS_BUCKET}/{object_name}"
 
 
+def _safe_slug(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "na"
+    s = s.replace(",", "").replace("/", " ").replace("\\", " ")
+    s = "_".join(s.split())
+    return "".join(ch for ch in s if ch.isalnum() or ch in {"_", "-"})
+
+
+def upload_run_output_excel(df: pd.DataFrame, city: str) -> str:
+    """
+    Saves a per-run Excel file to GCS under outputs/yelp/
+    so the dashboard Outputs tab + Hunter file picker can see it.
+    """
+    if df is None or df.empty:
+        return ""
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")  # naive UTC
+    city_slug = _safe_slug(city)
+    label_slug = _safe_slug(RUN_LABEL) if RUN_LABEL else "run"
+
+    filename = f"yelp_{label_slug}_{city_slug}_{ts}.xlsx"
+    local_path = f"/tmp/{filename}"
+
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(local_path, index=False)
+
+    object_name = f"{GCS_OUTPUT_PREFIX}/yelp/{filename}"
+    return gcs_upload(
+        local_path,
+        object_name,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# -----------------------------
+# Progress / Seen
+# -----------------------------
 def load_progress():
     if GCS_BUCKET:
         gcs_download_if_exists(PROGRESS_FILE, GCS_PROGRESS_OBJECT)
@@ -100,7 +164,7 @@ def save_progress(p):
         json.dump(p, f, indent=2)
 
     if GCS_BUCKET:
-        gcs_path = gcs_upload(PROGRESS_FILE, GCS_PROGRESS_OBJECT)
+        gcs_path = gcs_upload(PROGRESS_FILE, GCS_PROGRESS_OBJECT, content_type="application/json")
         if gcs_path:
             print(f"☁️ Uploaded progress: {gcs_path}")
 
@@ -124,7 +188,7 @@ def save_seen_urls(s):
         json.dump(list(s), f, indent=2)
 
     if GCS_BUCKET:
-        gcs_path = gcs_upload(SEEN_URLS_FILE, GCS_SEEN_URLS_OBJECT)
+        gcs_path = gcs_upload(SEEN_URLS_FILE, GCS_SEEN_URLS_OBJECT, content_type="application/json")
         if gcs_path:
             print(f"☁️ Uploaded seen-urls: {gcs_path}")
 
@@ -136,6 +200,9 @@ def get_next_city(progress):
     return CITIES[0]
 
 
+# -----------------------------
+# Master file
+# -----------------------------
 def load_existing_data():
     if GCS_BUCKET:
         gcs_download_if_exists(MASTER_FILE, GCS_MASTER_OBJECT)
@@ -149,23 +216,31 @@ def load_existing_data():
 
 
 def save_to_master(existing, new, city):
-    new["Scraped_Date"] = datetime.now().strftime("%Y-%m-%d")
+    new["Scraped_Date"] = datetime.utcnow().strftime("%Y-%m-%d")
     new["Batch_City"] = city
 
     combined = pd.concat([new, existing], ignore_index=True) if not existing.empty else new
-    combined.drop_duplicates(subset=["Yelp_URL"], keep="first", inplace=True)
+    if "Yelp_URL" in combined.columns:
+        combined.drop_duplicates(subset=["Yelp_URL"], keep="first", inplace=True)
 
     Path(MASTER_FILE).parent.mkdir(parents=True, exist_ok=True)
     combined.to_excel(MASTER_FILE, index=False)
 
     if GCS_BUCKET:
-        gcs_path = gcs_upload(MASTER_FILE, GCS_MASTER_OBJECT)
+        gcs_path = gcs_upload(
+            MASTER_FILE,
+            GCS_MASTER_OBJECT,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
         if gcs_path:
             print(f"☁️ Uploaded master file: {gcs_path}")
 
     return combined
 
 
+# -----------------------------
+# Scrape
+# -----------------------------
 def scrape_city(city, keywords, seen_urls):
     print(f"\nScraping {city}")
     results = []
@@ -209,6 +284,9 @@ def scrape_city(city, keywords, seen_urls):
     return results, seen_urls
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main(selected_city=None, selected_keywords=None, use_progress=False):
     run_id = start_run("yelp", os.getenv("RUN_LABEL", ""))
 
@@ -235,28 +313,36 @@ def main(selected_city=None, selected_keywords=None, use_progress=False):
         if new:
             df = pd.DataFrame(new)
 
+            # Save master
             save_to_master(existing, df, city)
 
+            # Add runtime metadata
             df_live = df.copy()
-            df_live["Scraped_Date"] = datetime.now().strftime("%Y-%m-%d")
+            df_live["Scraped_Date"] = datetime.utcnow().strftime("%Y-%m-%d")
             df_live["Batch_City"] = city
-            df_live["Scraped_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df_live["Scraped_Timestamp"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+            # Write to DB (Results tab)
             insert_df(run_id, "yelp", df_live)
 
+            # Upload a per-run Excel to outputs/yelp/ (Outputs tab + Hunter picker)
+            gcs_run_file = upload_run_output_excel(df_live, city)
+            if gcs_run_file:
+                print(f"☁️ Uploaded run output: {gcs_run_file}")
+
+            # Progress updates
             progress["total_runs"] = int(progress.get("total_runs", 0)) + 1
             if city not in progress.get("completed_cities", []):
                 progress.setdefault("completed_cities", []).append(city)
             save_progress(progress)
-
             save_seen_urls(seen)
-            print(f"Added {len(df)} new records.")
 
+            print(f"Added {len(df)} new records.")
             finish_run(run_id, "ok")
+
         else:
             print("No new results.")
 
-            # still mark city as done if you're using progress mode
             if city not in progress.get("completed_cities", []):
                 progress.setdefault("completed_cities", []).append(city)
             progress["total_runs"] = int(progress.get("total_runs", 0)) + 1
@@ -264,7 +350,6 @@ def main(selected_city=None, selected_keywords=None, use_progress=False):
             save_seen_urls(seen)
             save_progress(progress)
             finish_run(run_id, "ok")
-
 
     except Exception:
         finish_run(run_id, "error")
