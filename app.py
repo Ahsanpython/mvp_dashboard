@@ -344,8 +344,16 @@ with tab_run:
         if keyword_groups:
             group_names = list(keyword_groups.keys())
             selected_keyword_group = st.selectbox("Category", group_names, index=0)
+
             base_options = keyword_groups.get(selected_keyword_group) or []
-            selected_keywords = st.multiselect("Select", options=base_options, default=base_options)
+
+            # FIX: let user paste additional keywords and still populate "Select"
+            pasted = st.text_area("Paste one per line (optional)", value="", height=90)
+            pasted_list = [k.strip() for k in pasted.splitlines() if k.strip()]
+
+            merged_options = list(dict.fromkeys(base_options + pasted_list))
+
+            selected_keywords = st.multiselect("Select", options=merged_options, default=base_options)
             selected_keywords_pipe = _pipe_join(selected_keywords)
         else:
             # Flat list mode
@@ -525,6 +533,15 @@ with tab_results:
 
                 from io import BytesIO
 
+                # FIX: Excel cannot write tz-aware datetimes
+                def _excel_safe_df(df: pd.DataFrame) -> pd.DataFrame:
+                    df2 = df.copy()
+                    for col in df2.columns:
+                        s = df2[col]
+                        if pd.api.types.is_datetime64tz_dtype(s):
+                            df2[col] = s.dt.tz_convert(None)
+                    return df2
+
                 cexp1, cexp2 = st.columns([0.5, 0.5])
                 with cexp1:
                     csv_bytes = view_df.to_csv(index=False).encode("utf-8")
@@ -537,8 +554,9 @@ with tab_results:
                     )
                 with cexp2:
                     buf = BytesIO()
+                    view_df_xlsx = _excel_safe_df(view_df)
                     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                        view_df.to_excel(writer, index=False, sheet_name="data")
+                        view_df_xlsx.to_excel(writer, index=False, sheet_name="data")
                     st.download_button(
                         "Download Excel",
                         data=buf.getvalue(),
