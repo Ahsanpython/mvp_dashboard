@@ -52,7 +52,11 @@ if not CITY_LIST:
 # Module config
 # IMPORTANT: Dashboard cannot read keywords from each job's python file.
 # You must provide keywords for each module via env MODULE_CONFIG_JSON (recommended).
-# If not provided, keywords UI stays empty and user can type/paste.
+# Supported JSON patterns:
+# 1) list keywords:
+#    {"YouTube": {"keywords": ["peptide","biohacking"]}}
+# 2) grouped keywords:
+#    {"YouTube": {"keyword_groups": {"Peptide": ["peptide","bpc157"], "Biohacking": ["biohacking"]}}}
 # -----------------------------
 DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
     "Google Maps": {
@@ -83,6 +87,7 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "needs_city": False,
         "needs_keywords": True,
         "keywords": [],
+        "keyword_groups": {},
     },
     "TikTok Hashtags": {
         "job": "job-tiktok-hashtags",
@@ -90,6 +95,7 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "needs_city": False,
         "needs_keywords": True,
         "keywords": [],
+        "keyword_groups": {},
     },
     "TikTok Followers": {
         "job": "job-tiktok-followers",
@@ -105,6 +111,7 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
         "needs_city": False,
         "needs_keywords": True,
         "keywords": [],
+        "keyword_groups": {},
     },
     "Instagram Followers": {
         "job": "job-instagram-followers",
@@ -116,12 +123,6 @@ DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Allow overriding via env var (best practice for production)
-# Format:
-# {
-#   "Google Maps": {"keywords": ["Medspa","Botox"], "needs_city": true},
-#   "TikTok Hashtags": {"keywords": ["#medspa","#skincare"]}
-# }
 MODULES = json.loads(json.dumps(DEFAULT_MODULES))
 raw_cfg = (os.getenv("MODULE_CONFIG_JSON") or "").strip()
 if raw_cfg:
@@ -309,24 +310,55 @@ with tab_run:
 
     # Keywords / Hashtags (only when needed)
     selected_keywords_pipe = ""
+    selected_keyword_group = ""
     if bool(mcfg.get("needs_keywords")):
         st.markdown("#### Keywords / Hashtags")
 
+        # Support either:
+        # - keywords: ["a","b"]
+        # - keyword_groups: {"Peptide":[...], "Biohacking":[...]}
         preset_keywords = mcfg.get("keywords") or []
-        preset_keywords = [str(x).strip() for x in preset_keywords if str(x).strip()]
+        keyword_groups = mcfg.get("keyword_groups") or {}
 
-        # allow user to add quick entries without showing a big textarea
-        add_text = st.text_input("Add keywords (comma-separated)", value="")
-        added = [x.strip() for x in add_text.split(",") if x.strip()]
-        all_keywords = sorted(list(dict.fromkeys(preset_keywords + added)))
+        # If keywords accidentally came as dict, treat it as groups
+        if isinstance(preset_keywords, dict) and not keyword_groups:
+            keyword_groups = preset_keywords
+            preset_keywords = []
 
-        # if no preset exists yet, allow paste box but keep it clean
-        if not all_keywords:
-            pasted = st.text_area("Paste one per line", value="", height=90)
-            all_keywords = [k.strip() for k in pasted.splitlines() if k.strip()]
+        # Clean
+        if isinstance(preset_keywords, list):
+            preset_keywords = [str(x).strip() for x in preset_keywords if str(x).strip()]
+        else:
+            preset_keywords = []
 
-        selected_keywords = st.multiselect("Select", options=all_keywords, default=all_keywords)
-        selected_keywords_pipe = _pipe_join(selected_keywords)
+        if isinstance(keyword_groups, dict):
+            keyword_groups = {
+                str(g).strip(): [str(x).strip() for x in (vals or []) if str(x).strip()]
+                for g, vals in keyword_groups.items()
+                if str(g).strip()
+            }
+        else:
+            keyword_groups = {}
+
+        # If grouped mode exists, show group selector
+        if keyword_groups:
+            group_names = list(keyword_groups.keys())
+            selected_keyword_group = st.selectbox("Category", group_names, index=0)
+            base_options = keyword_groups.get(selected_keyword_group) or []
+            selected_keywords = st.multiselect("Select", options=base_options, default=base_options)
+            selected_keywords_pipe = _pipe_join(selected_keywords)
+        else:
+            # Flat list mode
+            add_text = st.text_input("Add keywords (comma-separated)", value="")
+            added = [x.strip() for x in add_text.split(",") if x.strip()]
+            all_keywords = sorted(list(dict.fromkeys(preset_keywords + added)))
+
+            if not all_keywords:
+                pasted = st.text_area("Paste one per line", value="", height=90)
+                all_keywords = [k.strip() for k in pasted.splitlines() if k.strip()]
+
+            selected_keywords = st.multiselect("Select", options=all_keywords, default=all_keywords)
+            selected_keywords_pipe = _pipe_join(selected_keywords)
 
     # City (only when needed)
     selected_city = ""
@@ -342,7 +374,6 @@ with tab_run:
             st.error("Storage not set.")
             st.stop()
         else:
-            # Recommend yelp subfolder first, but still allow any yelp files
             prefix = f"{GCS_OUTPUT_PREFIX}/"
             items = _gcs_list(prefix=prefix, limit=300)
             yelp_like = [it for it in items if "yelp" in it["name"].lower()]
@@ -397,6 +428,9 @@ with tab_run:
             env["SELECTED_KEYWORDS"] = selected_keywords_pipe
             env["KEYWORDS"] = selected_keywords_pipe
             env["SELECTED_HASHTAGS"] = selected_keywords_pipe
+
+        if selected_keyword_group:
+            env["KEYWORD_GROUP"] = selected_keyword_group
 
         if selected_city.strip():
             env["SELECTED_CITY"] = selected_city.strip()
@@ -466,7 +500,6 @@ with tab_results:
 
         with right:
             st.subheader("Data")
-            # show per-source; keeps columns clean per module
             src = st.selectbox("Source", list({v["source"] for v in MODULES.values()}), index=0)
             limit = st.number_input("Rows", min_value=10, max_value=5000, value=200, step=10)
 
@@ -484,14 +517,12 @@ with tab_results:
             if events_df is None or events_df.empty:
                 st.caption("No data yet.")
             else:
-                # Excel-like view: flatten payload dict to columns
                 flat = pd.json_normalize(events_df["payload"].tolist())
                 meta = events_df[["id", "run_id", "source", "created_at"]].reset_index(drop=True)
                 view_df = pd.concat([meta, flat], axis=1)
 
                 st.dataframe(view_df, use_container_width=True, height=420)
 
-                # Export buttons
                 from io import BytesIO
 
                 cexp1, cexp2 = st.columns([0.5, 0.5])
