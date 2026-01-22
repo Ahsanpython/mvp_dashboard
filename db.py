@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
@@ -34,10 +34,7 @@ def _engine():
 
 
 def _jsonable(obj: Any) -> Any:
-    """
-    Convert pandas / datetime / weird objects into JSON-safe types.
-    Always returns something that json.dumps can handle.
-    """
+    """Convert pandas/datetime/weird objects into JSON-safe types."""
     if obj is None:
         return None
 
@@ -52,13 +49,13 @@ def _jsonable(obj: Any) -> Any:
     if isinstance(obj, datetime):
         return obj.isoformat()
 
-    # basic containers: recurse
+    # containers: recurse
     if isinstance(obj, dict):
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
 
-    # everything else: keep if json can handle, otherwise stringify
+    # keep if json supports, else stringify
     try:
         json.dumps(obj)
         return obj
@@ -66,11 +63,9 @@ def _jsonable(obj: Any) -> Any:
         return str(obj)
 
 
-def _as_jsonb(v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Make sure we always pass a JSONB-friendly python object to SQLAlchemy.
-    """
-    if not v:
+def _as_jsonb(v: Any) -> Any:
+    """Return JSON-serialisable Python object (dict/list/str/num/None)."""
+    if v is None:
         return None
     return _jsonable(v)
 
@@ -78,8 +73,7 @@ def _as_jsonb(v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 def init_db():
     """
     Creates tables + indexes if needed.
-    If your DB user is not the owner, CREATE INDEX can fail with:
-    'must be owner of table ...'
+    Index creation can fail if DB user isn't the table owner.
     """
     eng = _engine()
     with eng.begin() as conn:
@@ -135,14 +129,13 @@ def finish_run(run_id: int, status: str, meta: Optional[Dict[str, Any]] = None):
     init_db()
     eng = _engine()
 
-    meta2 = _as_jsonb(meta)
-
-    # Use explicit JSONB bind to avoid psycopg2 "can't adapt dict" issues
     stmt = text("""
         UPDATE runs
-        SET status=:status, finished_at=:finished_at, meta=:meta
+        SET status=:status,
+            finished_at=:finished_at,
+            meta=:meta
         WHERE id=:id
-    """).bindparams(meta=JSONB)
+    """).bindparams(bindparam("meta", type_=JSONB))
 
     with eng.begin() as conn:
         conn.execute(
@@ -151,7 +144,7 @@ def finish_run(run_id: int, status: str, meta: Optional[Dict[str, Any]] = None):
                 "id": int(run_id),
                 "status": status,
                 "finished_at": _utcnow(),
-                "meta": meta2,
+                "meta": _as_jsonb(meta),
             },
         )
 
@@ -160,12 +153,10 @@ def insert_event(run_id: int, source: str, payload: Dict[str, Any]):
     init_db()
     eng = _engine()
 
-    payload2 = _as_jsonb(payload) or {}
-
     stmt = text("""
         INSERT INTO events (run_id, source, created_at, payload)
         VALUES (:run_id, :source, :created_at, :payload)
-    """).bindparams(payload=JSONB)
+    """).bindparams(bindparam("payload", type_=JSONB))
 
     with eng.begin() as conn:
         conn.execute(
@@ -174,7 +165,7 @@ def insert_event(run_id: int, source: str, payload: Dict[str, Any]):
                 "run_id": int(run_id),
                 "source": source,
                 "created_at": _utcnow(),
-                "payload": payload2,
+                "payload": _as_jsonb(payload) or {},
             },
         )
 
@@ -188,13 +179,12 @@ def insert_df(run_id: int, source: str, df: pd.DataFrame):
 
     df2 = df.copy()
     df2 = df2.where(pd.notnull(df2), None)
-
     rows = df2.to_dict(orient="records")
 
     stmt = text("""
         INSERT INTO events (run_id, source, created_at, payload)
         VALUES (:run_id, :source, :created_at, :payload)
-    """).bindparams(payload=JSONB)
+    """).bindparams(bindparam("payload", type_=JSONB))
 
     with eng.begin() as conn:
         for r in rows:
@@ -207,3 +197,4 @@ def insert_df(run_id: int, source: str, df: pd.DataFrame):
                     "payload": _as_jsonb(r) or {},
                 },
             )
+
