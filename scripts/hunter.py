@@ -427,7 +427,7 @@ def main():
         # 4) Insert live rows for dashboard Results tab
         if live_rows:
             df_live = pd.DataFrame(live_rows)
-            insert_df(run_id, "hunter_enriched", df_live)
+            insert_df(run_id, "hunter", df_live)
 
         progress["processed_yelp_urls"] = sorted(list(processed_urls))
         progress["total_runs"] = int(progress.get("total_runs", 0)) + 1
