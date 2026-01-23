@@ -14,12 +14,9 @@ except Exception:
     storage = None
 
 
-INPUT_FILE = os.getenv("HUNTER_INPUT_FILE", "/tmp/Yelp_Master_Data.xlsx")
-OUTPUT_FILE = os.getenv("HUNTER_OUTPUT_FILE", "/tmp/Yelp_Master_Data.xlsx")
-WEBSITE_COL = os.getenv("HUNTER_WEBSITE_COL", "Website")
-YELP_URL_COL = os.getenv("HUNTER_YELP_URL_COL", "Yelp_URL")
-PROGRESS_FILE = os.getenv("HUNTER_PROGRESS_FILE", "/tmp/hunter_progress.json")
-
+# -----------------------------
+# ENV
+# -----------------------------
 HUNTER_API_KEY = os.getenv("HUNTER_API_KEY", "").strip()
 if not HUNTER_API_KEY:
     raise ValueError("Missing HUNTER_API_KEY env var")
@@ -27,8 +24,30 @@ if not HUNTER_API_KEY:
 HUNTER_DOMAIN_SEARCH_URL = "https://api.hunter.io/v2/domain-search"
 
 GCS_BUCKET = (os.getenv("GCS_BUCKET") or "").strip()
-GCS_YELP_MASTER_OBJECT = os.getenv("GCS_YELP_MASTER_OBJECT", "exports/yelp/Yelp_Master_Data.xlsx")
-GCS_HUNTER_PROGRESS_OBJECT = os.getenv("GCS_HUNTER_PROGRESS_OBJECT", "exports/yelp/hunter_progress.json")
+GCS_OUTPUT_PREFIX = (os.getenv("GCS_OUTPUT_PREFIX") or "outputs").strip().strip("/")
+
+# Dashboard passes this (from dropdown): gs://bucket/outputs/yelp/....
+YELP_INPUT_GCS = (os.getenv("YELP_INPUT_GCS") or "").strip()
+
+# Local temp files
+INPUT_FILE = os.getenv("HUNTER_INPUT_FILE", "/tmp/hunter_input.xlsx")
+OUTPUT_FILE = os.getenv("HUNTER_OUTPUT_FILE", "/tmp/hunter_output.xlsx")
+PROGRESS_FILE = os.getenv("HUNTER_PROGRESS_FILE", "/tmp/hunter_progress.json")
+
+WEBSITE_COL = os.getenv("HUNTER_WEBSITE_COL", "Website")
+YELP_URL_COL = os.getenv("HUNTER_YELP_URL_COL", "Yelp_URL")
+
+# Store state + outputs under outputs/ so Streamlit "Outputs" can see them
+GCS_HUNTER_PROGRESS_OBJECT = os.getenv(
+    "GCS_HUNTER_PROGRESS_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/hunter/state/hunter_progress.json",
+)
+
+# Optional: overwrite the same enriched master each time (useful)
+GCS_HUNTER_MASTER_OBJECT = os.getenv(
+    "GCS_HUNTER_MASTER_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/hunter/Hunter_Enriched_Master.xlsx",
+)
 
 SKIP_HOSTS = {
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
@@ -48,10 +67,24 @@ FINAL_STATUSES = {
 }
 
 
+# -----------------------------
+# GCS helpers
+# -----------------------------
 def _gcs_client():
     if not GCS_BUCKET or storage is None:
         return None
     return storage.Client()
+
+
+def _parse_gs_uri(gs_uri: str):
+    # returns (bucket, object_name)
+    if not gs_uri.startswith("gs://"):
+        return None, None
+    no = gs_uri[5:]
+    parts = no.split("/", 1)
+    if len(parts) != 2:
+        return None, None
+    return parts[0], parts[1]
 
 
 def gcs_download_if_exists(local_path: str, object_name: str) -> bool:
@@ -60,6 +93,22 @@ def gcs_download_if_exists(local_path: str, object_name: str) -> bool:
         return False
     bucket = c.bucket(GCS_BUCKET)
     blob = bucket.blob(object_name)
+    if not blob.exists():
+        return False
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(local_path)
+    return True
+
+
+def gcs_download_gsuri(local_path: str, gs_uri: str) -> bool:
+    c = _gcs_client()
+    if not c:
+        return False
+    bkt, obj = _parse_gs_uri(gs_uri)
+    if not bkt or not obj:
+        return False
+    bucket = c.bucket(bkt)
+    blob = bucket.blob(obj)
     if not blob.exists():
         return False
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +126,9 @@ def gcs_upload(local_path: str, object_name: str) -> str:
     return f"gs://{GCS_BUCKET}/{object_name}"
 
 
+# -----------------------------
+# Progress
+# -----------------------------
 def load_progress():
     if GCS_BUCKET:
         gcs_download_if_exists(PROGRESS_FILE, GCS_HUNTER_PROGRESS_OBJECT)
@@ -105,6 +157,9 @@ def save_progress(p):
         gcs_upload(PROGRESS_FILE, GCS_HUNTER_PROGRESS_OBJECT)
 
 
+# -----------------------------
+# Hunter logic (unchanged)
+# -----------------------------
 def to_domain(value):
     if value is None:
         return None
@@ -189,15 +244,28 @@ def row_already_done(df, i, processed_urls: set) -> bool:
     return False
 
 
+def _write_and_upload_run_file(df_out: pd.DataFrame, run_id: int) -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    local_path = f"/tmp/hunter_enriched_{ts}_{run_id}.xlsx"
+    df_out.to_excel(local_path, index=False)
+
+    object_name = f"{GCS_OUTPUT_PREFIX}/hunter/runs/hunter_enriched_{ts}_{run_id}.xlsx"
+    if GCS_BUCKET:
+        return gcs_upload(local_path, object_name)
+    return ""
+
+
 def main():
     run_id = start_run("hunter", os.getenv("RUN_LABEL", ""))
 
     try:
-        if not HUNTER_API_KEY:
-            raise SystemExit("Hunter API key missing")
+        # 1) Download selected Yelp file from UI
+        if not YELP_INPUT_GCS:
+            raise SystemExit("Missing YELP_INPUT_GCS. Select a Yelp file in the dashboard first.")
 
-        if GCS_BUCKET:
-            gcs_download_if_exists(INPUT_FILE, GCS_YELP_MASTER_OBJECT)
+        ok = gcs_download_gsuri(INPUT_FILE, YELP_INPUT_GCS)
+        if not ok:
+            raise SystemExit(f"Could not download input from: {YELP_INPUT_GCS}")
 
         if not os.path.exists(INPUT_FILE):
             raise SystemExit(f"Input file not found: {INPUT_FILE}")
@@ -205,10 +273,10 @@ def main():
         df = pd.read_excel(INPUT_FILE)
 
         if WEBSITE_COL not in df.columns:
-            raise SystemExit(f"Column '{WEBSITE_COL}' not found in {INPUT_FILE}")
+            raise SystemExit(f"Column '{WEBSITE_COL}' not found in input file")
 
         if YELP_URL_COL not in df.columns:
-            raise SystemExit(f"Column '{YELP_URL_COL}' not found in {INPUT_FILE}")
+            raise SystemExit(f"Column '{YELP_URL_COL}' not found in input file")
 
         out_cols = [
             "hunter_domain",
@@ -234,6 +302,7 @@ def main():
         progress = load_progress()
         processed_urls = set(progress.get("processed_yelp_urls", []))
 
+        # quick API test
         test = hunter_domain_search("hunter.io", limit=5)
         if test.get("_error"):
             print("API TEST FAILED:", test.get("_error"))
@@ -244,7 +313,6 @@ def main():
         cache = {}
         enriched_now = 0
         skipped_done = 0
-
         live_rows = []
 
         for i, raw_site in enumerate(df[WEBSITE_COL].tolist()):
@@ -345,16 +413,21 @@ def main():
                 "hunter_enriched_at": now_ts,
             })
 
+        # 2) Save local output
         Path(OUTPUT_FILE).parent.mkdir(parents=True, exist_ok=True)
         df.to_excel(OUTPUT_FILE, index=False)
 
+        # 3) Upload a stable master + a per-run file (visible in Outputs tab)
         if GCS_BUCKET:
-            gcs_upload(OUTPUT_FILE, GCS_YELP_MASTER_OBJECT)
+            gcs_upload(OUTPUT_FILE, GCS_HUNTER_MASTER_OBJECT)
+            run_file_gs = _write_and_upload_run_file(df, run_id)
+            if run_file_gs:
+                print(f"☁️ Uploaded run file: {run_file_gs}")
 
+        # 4) Insert live rows for dashboard Results tab
         if live_rows:
             df_live = pd.DataFrame(live_rows)
             insert_df(run_id, "hunter_enriched", df_live)
-
 
         progress["processed_yelp_urls"] = sorted(list(processed_urls))
         progress["total_runs"] = int(progress.get("total_runs", 0)) + 1
