@@ -10,12 +10,18 @@ try:
 except Exception:
     storage = None
 
+try:
+    from sqlalchemy import create_engine
+except Exception:
+    create_engine = None
+
 
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
 if not APIFY_TOKEN:
     raise ValueError("Missing APIFY_TOKEN env var")
 
 client = ApifyClient(APIFY_TOKEN)
+
 
 REELS_ACTOR_ID = os.getenv("IG_REELS_ACTOR_ID", "reGe1ST3OBgYZSsZJ")
 PROFILE_ACTOR_ID = os.getenv("IG_PROFILE_ACTOR_ID", "dSCLg0C3YEZ83HzYX")
@@ -26,11 +32,38 @@ BATCH_SIZE = int(os.getenv("IG_BATCH_SIZE", "30"))
 OUTPUT_FILE = os.getenv("IG_OUTPUT_FILE", "/tmp/instagram_influencers.xlsx")
 PROGRESS_FILE = os.getenv("IG_PROGRESS_FILE", "/tmp/instagram_progress.json")
 
-GCS_BUCKET = (os.getenv("GCS_BUCKET") or "").strip()
-GCS_IG_OUTPUT_OBJECT = "exports/social/instagram/instagram_influencers.xlsx"
-GCS_IG_PROGRESS_OBJECT = "exports/social/instagram/instagram_progress.json"
+SAVE_REELS_RAW = os.getenv("IG_SAVE_REELS_RAW", "0") == "1"
+REELS_RAW_FILE = os.getenv("IG_REELS_RAW_FILE", "/tmp/instagram_reels_raw.xlsx")
 
-SOURCE_NAME = "instagram_combined"
+GCS_BUCKET = (os.getenv("GCS_BUCKET") or "").strip()
+
+# Dashboard lists files under this prefix (default: outputs/)
+GCS_OUTPUT_PREFIX = (os.getenv("GCS_OUTPUT_PREFIX") or "outputs").strip().strip("/")
+
+# Put all Instagram artifacts under outputs/ so the Ops Console "Outputs" tab can see them
+GCS_IG_OUTPUT_OBJECT = os.getenv(
+    "GCS_IG_OUTPUT_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/social/instagram/instagram_influencers.xlsx"
+)
+
+GCS_IG_PROGRESS_OBJECT = os.getenv(
+    "GCS_IG_PROGRESS_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/social/instagram/instagram_progress.json"
+)
+
+GCS_IG_REELS_RAW_OBJECT = os.getenv(
+    "GCS_IG_REELS_RAW_OBJECT",
+    f"{GCS_OUTPUT_PREFIX}/social/instagram/instagram_reels_raw.xlsx"
+)
+
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+# IMPORTANT:
+# The dashboard "Results" tab filters by events.source.
+# Your module source in app.py is "instagram_combined".
+# So we write DB events using DB_TABLE="instagram_combined" by default.
+DB_TABLE = os.getenv("IG_DB_TABLE", "instagram_combined")
+
 
 CATEGORIES = {
     "Peptide": [
@@ -56,26 +89,49 @@ def _gcs_client():
     return storage.Client()
 
 
-def gcs_upload(local_path: str, object_name: str):
+def gcs_download_if_exists(local_path: str, object_name: str) -> bool:
     c = _gcs_client()
     if not c:
-        return
+        return False
+    bucket = c.bucket(GCS_BUCKET)
+    blob = bucket.blob(object_name)
+    if not blob.exists():
+        return False
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(local_path)
+    return True
+
+
+def gcs_upload(local_path: str, object_name: str) -> str:
+    c = _gcs_client()
+    if not c:
+        return ""
     bucket = c.bucket(GCS_BUCKET)
     blob = bucket.blob(object_name)
     blob.upload_from_filename(local_path)
+    return f"gs://{GCS_BUCKET}/{object_name}"
+
+
+def parse_pipe_list(val):
+    if not val:
+        return []
+    s = str(val).strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split("|") if x.strip()]
 
 
 def load_progress():
     if GCS_BUCKET:
-        c = _gcs_client()
-        blob = c.bucket(GCS_BUCKET).blob(GCS_IG_PROGRESS_OBJECT)
-        if blob.exists():
-            blob.download_to_filename(PROGRESS_FILE)
+        gcs_download_if_exists(PROGRESS_FILE, GCS_IG_PROGRESS_OBJECT)
 
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
-            return json.load(f)
-    return {"processed_usernames": [], "total_runs": 0}
+        try:
+            with open(PROGRESS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"processed_usernames": [], "total_runs": 0, "last_run_date": None}
 
 
 def save_progress(p):
@@ -87,63 +143,269 @@ def save_progress(p):
         gcs_upload(PROGRESS_FILE, GCS_IG_PROGRESS_OBJECT)
 
 
+def normalize_followers(f):
+    try:
+        f = float(f)
+    except:
+        f = 0.0
+    if f <= 1000:
+        return f / 1000
+    elif f <= 10000:
+        return 0.1 + (f - 1000) / 9000 * 0.4
+    elif f <= 100000:
+        return 0.5 + (f - 10000) / 90000 * 0.4
+    else:
+        return 0.9 + min((f - 100000) / 1000000, 0.1)
+
+
 def scrape_reels(category, hashtag):
-    run = client.actor(REELS_ACTOR_ID).call({
-        "hashtags": [hashtag],
-        "resultsType": "reels",
-        "resultsLimit": RESULTS_PER_HASHTAG
-    })
+    print(f"🚀 Scraping Reels | Category: {category} | #{hashtag}")
+    run_input = {"hashtags": [hashtag], "resultsType": "reels", "resultsLimit": RESULTS_PER_HASHTAG}
+    run = client.actor(REELS_ACTOR_ID).call(run_input=run_input)
 
     rows = []
     for item in client.dataset(run["defaultDatasetId"]).iterate_items():
         rows.append({
             "category": category,
             "keyword": hashtag,
-            "username": item.get("ownerUsername", ""),
-            "likes": item.get("likesCount", 0),
-            "comments": item.get("commentsCount", 0),
-            "views": item.get("videoPlayCount", 0),
-            "post_url": item.get("url", ""),
-            "video_url": item.get("videoUrl", ""),
-            "reel_timestamp": item.get("timestamp", "")
+            "username": item.get("ownerUsername", "") or "",
+            "caption": item.get("caption", "") or "",
+            "likes": item.get("likesCount", 0) or 0,
+            "comments": item.get("commentsCount", 0) or 0,
+            "views": item.get("videoPlayCount", 0) or 0,
+            "video_url": item.get("videoUrl", "") or "",
+            "post_url": item.get("url", "") or "",
+            "reel_timestamp": item.get("timestamp", "") or ""
         })
+    print(f"✅ Done #{hashtag} → {len(rows)} reels")
     return rows
 
 
+def batch_profile_scrape(usernames):
+    run_input = {"usernames": usernames, "includeAboutSection": False}
+    run = client.actor(PROFILE_ACTOR_ID).call(run_input=run_input)
+
+    profiles = []
+    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        profiles.append({
+            "username": item.get("username", "") or "",
+            "followers": item.get("followersCount", 0) or 0,
+            "verified": item.get("isVerified", False),
+            "bio": item.get("biography", "") or ""
+        })
+    return pd.DataFrame(profiles)
+
+
+def load_existing_output():
+    if GCS_BUCKET:
+        gcs_download_if_exists(OUTPUT_FILE, GCS_IG_OUTPUT_OBJECT)
+
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            df = pd.read_excel(OUTPUT_FILE)
+            if "username" in df.columns:
+                df["username"] = df["username"].astype(str).str.strip()
+            return df
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def save_output(df: pd.DataFrame):
+    Path(OUTPUT_FILE).parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(OUTPUT_FILE, index=False)
+
+    if GCS_BUCKET:
+        gcs_upload(OUTPUT_FILE, GCS_IG_OUTPUT_OBJECT)
+
+
+def _build_run_plan_from_dashboard_env():
+    """
+    Dashboard sets:
+      - KEYWORD_GROUP (Category)
+      - SELECTED_HASHTAGS or SELECTED_KEYWORDS or KEYWORDS (pipe list)
+    """
+    group = (os.getenv("KEYWORD_GROUP") or "").strip()
+    raw = (os.getenv("SELECTED_HASHTAGS") or os.getenv("SELECTED_KEYWORDS") or os.getenv("KEYWORDS") or "").strip()
+    tags = parse_pipe_list(raw)
+
+    if group and tags:
+        return [{"category": group, "hashtags": tags}]
+
+    # If only tags exist, run them under a generic category label
+    if tags and not group:
+        return [{"category": "Selected", "hashtags": tags}]
+
+    # If only group exists, use default tags for that category if it exists
+    if group and not tags:
+        if group in CATEGORIES:
+            return [{"category": group, "hashtags": CATEGORIES[group]}]
+        return [{"category": group, "hashtags": []}]
+
+    return []
+
+
+def _build_run_plan_default():
+    # Your original env support (optional). Keeps old behavior.
+    def cat_to_env_key(cat_name: str) -> str:
+        return "IG_HASHTAGS_" + cat_name.upper().replace(" ", "_")
+
+    def get_selected_categories():
+        raw = os.getenv("IG_CATEGORIES", "").strip()
+        if raw:
+            selected = parse_pipe_list(raw)
+            selected = [c for c in selected if c in CATEGORIES]
+            if selected:
+                return selected
+        return list(CATEGORIES.keys())
+
+    def get_selected_hashtags_for_category(cat):
+        raw = os.getenv(cat_to_env_key(cat), "").strip()
+        if raw:
+            t = parse_pipe_list(raw)
+            allowed = set(CATEGORIES.get(cat, []))
+            t = [x for x in t if x in allowed]
+            if t:
+                return t
+        return CATEGORIES.get(cat, [])
+
+    selected_categories = get_selected_categories()
+    plan = []
+    for cat in selected_categories:
+        tags = get_selected_hashtags_for_category(cat)
+        plan.append({"category": cat, "hashtags": tags})
+    return plan
+
+
 def main():
-    run_id = start_run(SOURCE_NAME, os.getenv("RUN_LABEL", ""))
+    run_id = start_run("instagram_combined", os.getenv("RUN_LABEL", ""))
 
     try:
         progress = load_progress()
-        done = set(progress.get("processed_usernames", []))
+        done = set([str(u).lower() for u in progress.get("processed_usernames", [])])
 
-        all_rows = []
-        for cat, tags in CATEGORIES.items():
-            for tag in tags:
-                all_rows.extend(scrape_reels(cat, tag))
+        # First priority: dashboard env (Category + hashtags)
+        plan = _build_run_plan_from_dashboard_env()
 
-        df = pd.DataFrame(all_rows)
-        if df.empty:
+        # Fallback: original behavior
+        if not plan:
+            plan = _build_run_plan_default()
+
+        # Remove empty hashtag plans
+        plan = [p for p in plan if (p.get("hashtags") or [])]
+
+        print("\n🧭 Run plan:")
+        for p in plan:
+            print(f"  - {p['category']}: {len(p['hashtags'])} hashtags")
+
+        all_reels = []
+        for p in plan:
+            for tag in p["hashtags"]:
+                all_reels.extend(scrape_reels(p["category"], tag))
+
+        df_reels = pd.DataFrame(all_reels)
+        if df_reels.empty:
+            print("No reels collected.")
             finish_run(run_id, "ok")
             return
 
-        df["processed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df_reels["username"] = df_reels["username"].astype(str).str.strip()
+        df_reels = df_reels[df_reels["username"].notna() & (df_reels["username"] != "")]
 
-        # SAVE FILE
-        Path(OUTPUT_FILE).parent.mkdir(parents=True, exist_ok=True)
-        df.to_excel(OUTPUT_FILE, index=False)
+        if SAVE_REELS_RAW:
+            Path(REELS_RAW_FILE).parent.mkdir(parents=True, exist_ok=True)
+            df_reels.to_excel(REELS_RAW_FILE, index=False)
+            if GCS_BUCKET and os.path.exists(REELS_RAW_FILE):
+                gcs_upload(REELS_RAW_FILE, GCS_IG_REELS_RAW_OBJECT)
 
-        if GCS_BUCKET:
-            gcs_upload(OUTPUT_FILE, GCS_IG_OUTPUT_OBJECT)
+        df_reels_dedup = df_reels.drop_duplicates(subset=["username"], keep="first")
+        usernames = df_reels_dedup["username"].tolist()
 
-        # ✅ DASHBOARD RESULTS FIX
-        insert_df(run_id, SOURCE_NAME, df)
+        usernames_to_scrape = [u for u in usernames if u.lower() not in done]
+        print(f"✅ Unique usernames from reels: {len(usernames)}")
+        print(f"🆕 New usernames to profile-scrape: {len(usernames_to_scrape)} (skipping {len(usernames) - len(usernames_to_scrape)})")
 
-        progress["processed_usernames"] = sorted(set(done | set(df["username"])))
-        progress["total_runs"] += 1
+        df_existing = load_existing_output()
+
+        batch_profiles_all = []
+        total_batches = math.ceil(len(usernames_to_scrape) / BATCH_SIZE) if usernames_to_scrape else 0
+
+        for b in range(total_batches):
+            batch = usernames_to_scrape[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
+            if not batch:
+                continue
+
+            print(f"\n🚀 Profile Batch {b+1}/{total_batches} | {len(batch)} usernames")
+
+            try:
+                df_profiles = batch_profile_scrape(batch)
+                if not df_profiles.empty:
+                    batch_profiles_all.append(df_profiles)
+                    for u in df_profiles["username"].astype(str).tolist():
+                        if u:
+                            done.add(u.lower())
+                time.sleep(6)
+            except Exception as e:
+                print("⚠️ Batch profile error:", e)
+                time.sleep(10)
+
+        df_profiles_all = pd.concat(batch_profiles_all, ignore_index=True) if batch_profiles_all else pd.DataFrame(columns=["username", "followers", "verified", "bio"])
+
+        df_first = df_reels_dedup.merge(df_profiles_all, on="username", how="left")
+
+        df_first["likes"] = pd.to_numeric(df_first["likes"], errors="coerce").fillna(0)
+        df_first["comments"] = pd.to_numeric(df_first["comments"], errors="coerce").fillna(0)
+        df_first["views"] = pd.to_numeric(df_first["views"], errors="coerce").fillna(0)
+        df_first["followers"] = pd.to_numeric(df_first["followers"], errors="coerce").fillna(0)
+
+        df_first["engagement_rate"] = df_first.apply(
+            lambda r: round(((r["likes"] + r["comments"]) / r["views"]) * 100, 2) if r["views"] > 0 else 0,
+            axis=1
+        )
+        df_first["follower_score"] = df_first["followers"].apply(normalize_followers)
+        df_first["final_score"] = df_first.apply(
+            lambda r: round((r["engagement_rate"] / 100) * 0.4 + r["follower_score"] * 0.6, 2),
+            axis=1
+        )
+
+        df_final = df_first[[
+            "category", "keyword",
+            "username", "followers", "verified", "bio",
+            "likes", "comments", "views",
+            "engagement_rate", "final_score",
+            "post_url", "video_url",
+            "reel_timestamp"
+        ]].copy()
+
+        df_final["processed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # DB: write THIS RUN rows under source "instagram_combined" so Results tab shows it
+        try:
+            df_live = df_final.copy()
+            insert_df(run_id, DB_TABLE, df_live)
+        except Exception as e:
+            print("DB insert failed:", e)
+
+        if not df_existing.empty and "username" in df_existing.columns:
+            combined = pd.concat([df_final, df_existing], ignore_index=True)
+        else:
+            combined = df_final
+
+        combined["username"] = combined["username"].astype(str).str.strip()
+        combined.drop_duplicates(subset=["username"], keep="first", inplace=True)
+
+        # Save full combined file to GCS under outputs/ so Outputs tab shows it
+        save_output(combined)
+
+        progress["processed_usernames"] = sorted(list(set(progress.get("processed_usernames", []) + list(done))))
+        progress["total_runs"] = int(progress.get("total_runs", 0)) + 1
+        progress["last_run_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         save_progress(progress)
 
         finish_run(run_id, "ok")
+
+        print(f"\n✅ Saved final influencers: {OUTPUT_FILE}")
+        print(f"✅ Total influencers in file: {len(combined)}")
 
     except Exception:
         finish_run(run_id, "error")
