@@ -84,10 +84,6 @@ SOCIAL_CATEGORIES = {
 
 # -----------------------------
 # Module config
-# NOTE:
-# - The dashboard cannot read keywords from each job's python file.
-# - Best practice is MODULE_CONFIG_JSON in Cloud Run env vars.
-# - But we also provide solid defaults here so UI works right away.
 # -----------------------------
 DEFAULT_MODULES: Dict[str, Dict[str, Any]] = {
     "Google Maps": {
@@ -246,7 +242,7 @@ def _gcs_list(prefix: str, limit: int = 120) -> List[Dict[str, Any]]:
         low = name.lower()
         if low.endswith(".xlsx_toggle") or low.endswith(".tmp"):
             continue
-        if low.endswith(".xlsx") or low.endswith(".csv") or low.endswith(".json"):
+        if low.endswith(".xlsx") or low.endswith(".csv") or low.endswith(".json") or low.endswith(".txt"):
             items.append({"name": name, "updated": b.updated, "size": b.size or 0})
         if len(items) >= limit * 3:
             break
@@ -300,21 +296,13 @@ def _trigger(job_name: str, env: Dict[str, str]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Helpers: keyword parsing (fixes your "can’t select" issue)
-# Accepts:
-# - Python list like: ["A","B"]
-# - JSON list like: ["A","B"]
-# - Comma-separated like: A, B, C
-# - One-per-line
-# - Lines with comments starting #
-# - Lines like: "A", "B",
+# Helpers: keyword parsing
 # -----------------------------
 def _parse_keywords(raw: str) -> List[str]:
     if not raw:
         return []
     s = raw.strip()
 
-    # Try JSON list first
     if s.startswith("[") and s.endswith("]"):
         try:
             obj = json.loads(s)
@@ -328,7 +316,6 @@ def _parse_keywords(raw: str) -> List[str]:
         except Exception:
             pass
 
-    # Otherwise: split by newline + comma
     tokens: List[str] = []
     for line in s.splitlines():
         line = line.strip()
@@ -336,27 +323,22 @@ def _parse_keywords(raw: str) -> List[str]:
             continue
         if line.startswith("#"):
             continue
-        # remove trailing commas
         if line.endswith(","):
             line = line[:-1].strip()
-        # if line contains commas, split
         parts = [p.strip() for p in line.split(",") if p.strip()]
         for p in parts:
-            # strip quotes
             if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
                 p = p[1:-1].strip()
-            # ignore python assignment prefixes
             if "=" in p and p.lower().endswith("["):
                 continue
             if p:
                 tokens.append(p)
 
-    # de-dup, keep order
     return list(dict.fromkeys(tokens))
 
 
 # -----------------------------
-# Helpers: Excel-safe dataframe (fixes timezone crash)
+# Helpers: Excel-safe dataframe
 # -----------------------------
 def _excel_safe_df(df):
     if pd is None or df is None:
@@ -366,7 +348,6 @@ def _excel_safe_df(df):
     for col in out.columns:
         s = out[col]
 
-        # datetime64 tz-aware columns
         try:
             if hasattr(s.dtype, "tz") and s.dtype.tz is not None:
                 out[col] = s.dt.tz_convert(None)
@@ -374,7 +355,6 @@ def _excel_safe_df(df):
         except Exception:
             pass
 
-        # object columns that might contain tz-aware timestamps
         if s.dtype == "object":
             try:
                 parsed = pd.to_datetime(s, errors="raise", utc=True)
@@ -386,7 +366,7 @@ def _excel_safe_df(df):
 
 
 # -----------------------------
-# Sidebar (minimal)
+# Sidebar
 # -----------------------------
 with st.sidebar:
     st.markdown("### Status")
@@ -424,7 +404,7 @@ with tab_run:
 
     use_progress = st.checkbox("Use progress", value=False)
 
-    # Keywords / Hashtags (only when needed)
+    # Keywords / Hashtags
     selected_keywords_pipe = ""
     selected_keyword_group = ""
 
@@ -434,12 +414,10 @@ with tab_run:
         preset_keywords = mcfg.get("keywords") or []
         keyword_groups = mcfg.get("keyword_groups") or {}
 
-        # If keywords accidentally came as dict, treat it as groups
         if isinstance(preset_keywords, dict) and not keyword_groups:
             keyword_groups = preset_keywords
             preset_keywords = []
 
-        # Clean lists
         if isinstance(preset_keywords, list):
             preset_keywords = [str(x).strip() for x in preset_keywords if str(x).strip()]
         else:
@@ -454,7 +432,6 @@ with tab_run:
         else:
             keyword_groups = {}
 
-        # Optional: paste extra keywords (supports python list / comma / lines)
         extra_raw = st.text_area("Paste extra keywords (optional)", value="", height=80)
         extra_keywords = _parse_keywords(extra_raw)
 
@@ -462,12 +439,10 @@ with tab_run:
             group_names = list(keyword_groups.keys())
             selected_keyword_group = st.selectbox("Category", group_names, index=0)
             base_options = (keyword_groups.get(selected_keyword_group) or []) + extra_keywords
-            # de-dup keep order
             base_options = list(dict.fromkeys([x for x in base_options if x]))
             selected_keywords = st.multiselect("Select", options=base_options, default=base_options)
             selected_keywords_pipe = _pipe_join(selected_keywords)
         else:
-            # Flat list mode with strong parsing
             add_raw = st.text_area(
                 "Paste keywords (one per line, comma-separated, JSON list, or Python list)",
                 value="\n".join(preset_keywords),
@@ -477,7 +452,7 @@ with tab_run:
             selected_keywords = st.multiselect("Select", options=all_keywords, default=all_keywords)
             selected_keywords_pipe = _pipe_join(selected_keywords)
 
-    # City (only when needed)
+    # City
     selected_city = ""
     if bool(mcfg.get("needs_city")):
         st.markdown("#### City")
@@ -506,10 +481,28 @@ with tab_run:
 
     if bool(mcfg.get("followers_module")):
         st.markdown("#### Usernames")
-        input_mode = st.radio("Input", ["Single username", "Upload file"], horizontal=True)
+
+        # CHANGE: add "Select existing file"
+        input_mode = st.radio("Input", ["Single username", "Select existing file", "Upload file"], horizontal=True)
 
         if input_mode == "Single username":
             single_username = st.text_input("Username", value="")
+
+        elif input_mode == "Select existing file":
+            if not GCS_BUCKET:
+                st.error("Storage not set. Set GCS_BUCKET on the dashboard Cloud Run service.")
+                st.stop()
+
+            prefix_in = f"{GCS_INPUT_PREFIX}/"
+            items_in = _gcs_list(prefix=prefix_in, limit=300)
+            # only show txt/csv for usernames
+            pickables = [it for it in items_in if it["name"].lower().endswith((".txt", ".csv"))]
+            options = [""] + [it["name"] for it in pickables]
+            pick = st.selectbox("Pick usernames file (from GCS inputs)", options, index=0)
+
+            if pick:
+                uploaded_gcs_path = f"gs://{GCS_BUCKET}/{pick}"
+
         else:
             up = st.file_uploader("Upload usernames file", type=["txt", "csv"])
             if up is not None:
@@ -568,7 +561,7 @@ with tab_run:
                 env["USERNAMES_MODE"] = "file"
                 env["USERNAMES_GCS"] = uploaded_gcs_path.strip()
             else:
-                st.error("Provide a username or upload a file.")
+                st.error("Provide a username or pick/upload a file.")
                 st.stop()
 
         res = _trigger(job_name, env)
