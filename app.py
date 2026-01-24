@@ -495,8 +495,8 @@ with tab_run:
 
             prefix_in = f"{GCS_INPUT_PREFIX}/"
             items_in = _gcs_list(prefix=prefix_in, limit=300)
-            # only show txt/csv for usernames
-            pickables = [it for it in items_in if it["name"].lower().endswith((".txt", ".csv"))]
+            # CHANGE: allow excel too
+            pickables = [it for it in items_in if it["name"].lower().endswith((".txt", ".csv", ".xlsx"))]
             options = [""] + [it["name"] for it in pickables]
             pick = st.selectbox("Pick usernames file (from GCS inputs)", options, index=0)
 
@@ -504,7 +504,8 @@ with tab_run:
                 uploaded_gcs_path = f"gs://{GCS_BUCKET}/{pick}"
 
         else:
-            up = st.file_uploader("Upload usernames file", type=["txt", "csv"])
+            # CHANGE: allow excel upload
+            up = st.file_uploader("Upload usernames file", type=["txt", "csv", "xlsx"])
             if up is not None:
                 if not GCS_BUCKET:
                     st.error("Storage not set. Set GCS_BUCKET on the dashboard Cloud Run service.")
