@@ -1,7 +1,6 @@
 # app.py
 import os
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List
@@ -14,11 +13,10 @@ except Exception:
     pd = None
 
 try:
-    from sqlalchemy import create_engine, text, inspect
+    from sqlalchemy import create_engine, text
 except Exception:
     create_engine = None
     text = None
-    inspect = None
 
 try:
     from google.cloud import storage
@@ -222,51 +220,6 @@ def _db_read_df(sql: str, params=None):
     if not eng:
         return None
     return pd.read_sql_query(text(sql), eng, params=params or {})
-
-
-def _safe_table_name(name: str) -> str:
-    name = (name or "").strip()
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
-        return ""
-    return name
-
-
-def _table_columns(table_name: str) -> List[str]:
-    eng = _db_engine()
-    if not eng or inspect is None:
-        return []
-    try:
-        insp = inspect(eng)
-        cols = insp.get_columns(table_name)
-        return [c.get("name", "") for c in cols if c.get("name")]
-    except Exception:
-        return []
-
-
-def _db_read_table_df(table_name: str, lim: int = 200):
-    if pd is None or text is None:
-        return None
-    eng = _db_engine()
-    if not eng:
-        return None
-
-    t = _safe_table_name(table_name)
-    if not t:
-        return None
-
-    cols = _table_columns(t)
-    order_col = None
-    for candidate in ["scraped_at", "created_at", "id"]:
-        if candidate in cols:
-            order_col = candidate
-            break
-
-    if order_col:
-        sql = f"SELECT * FROM {t} ORDER BY {order_col} DESC LIMIT :lim"
-    else:
-        sql = f"SELECT * FROM {t} LIMIT :lim"
-
-    return pd.read_sql_query(text(sql), eng, params={"lim": int(lim)})
 
 
 # -----------------------------
@@ -661,37 +614,23 @@ with tab_results:
             src = st.selectbox("Source", list({v["source"] for v in MODULES.values()}), index=0)
             limit = st.number_input("Rows", min_value=10, max_value=5000, value=200, step=10)
 
-            followers_tables = {
-                "instagram_followers": os.getenv("IG_FOLLOWERS_DB_TABLE", "instagram_followers"),
-                "tiktok_followers": os.getenv("TT_FOLLOWERS_DB_TABLE", "tiktok_followers"),
-            }
+            events_df = _db_read_df(
+                """
+                SELECT id, run_id, source, created_at, payload
+                FROM events
+                WHERE source = :src
+                ORDER BY id DESC
+                LIMIT :lim
+                """,
+                {"src": src, "lim": int(limit)},
+            )
 
-            events_df = None
-            view_df = None
-
-            if src in followers_tables:
-                tname = followers_tables[src]
-                view_df = _db_read_table_df(tname, lim=int(limit))
-            else:
-                events_df = _db_read_df(
-                    """
-                    SELECT id, run_id, source, created_at, payload
-                    FROM events
-                    WHERE source = :src
-                    ORDER BY id DESC
-                    LIMIT :lim
-                    """,
-                    {"src": src, "lim": int(limit)},
-                )
-
-            if view_df is None and (events_df is None or events_df.empty):
+            if events_df is None or events_df.empty:
                 st.caption("No data yet.")
             else:
-                if view_df is None:
-                    flat = pd.json_normalize(events_df["payload"].tolist())
-                    meta = events_df[["id", "run_id", "source", "created_at"]].reset_index(drop=True)
-                    view_df = pd.concat([meta, flat], axis=1)
-
+                flat = pd.json_normalize(events_df["payload"].tolist())
+                meta = events_df[["id", "run_id", "source", "created_at"]].reset_index(drop=True)
+                view_df = pd.concat([meta, flat], axis=1)
                 view_df = _excel_safe_df(view_df)
 
                 st.dataframe(view_df, use_container_width=True, height=420)
@@ -761,3 +700,4 @@ with tab_outputs:
                         key=f"dl_{name}",
                         use_container_width=True,
                     )
+
